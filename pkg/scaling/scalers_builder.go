@@ -229,6 +229,8 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 		return scalers.NewPredictKubeScaler(ctx, config)
 	case "prometheus":
 		return scalers.NewPrometheusScaler(config)
+	case "predict-events":
+		return scalers.NewPredictEventsScaler(ctx, config)
 	case "pulsar":
 		return scalers.NewPulsarScaler(config)
 	case "rabbitmq":
