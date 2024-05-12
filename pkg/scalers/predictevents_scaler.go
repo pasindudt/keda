@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
@@ -49,7 +50,7 @@ type predictionSource struct {
 	// Authentication  *authentication.AuthMeta
 }
 
-type predictEventsScaler struct {
+type PredictEventsScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *predictEventsScalerMetadata
 	// logger     logr.Logger
@@ -156,7 +157,7 @@ func setPredictEventsScalerMetadata(meta *predictEventsScalerMetadata, config *s
 	return nil
 }
 
-func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (*predictEventsScaler, error) {
+func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (*PredictEventsScaler, error) {
 
 	// eventSource := &eventSource{}
 
@@ -173,14 +174,14 @@ func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerCon
 		return nil, err
 	}
 
-	predictEventsScaler := &predictEventsScaler{}
+	predictEventsScaler := &PredictEventsScaler{}
 	predictEventsScaler.metricType = metricType
 	predictEventsScaler.metadata = predictEventsScalerMetadata
 
 	return predictEventsScaler, nil
 }
 
-func (s *predictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	val, err := s.metadata.predictionSource.getPrediction()
 
 	if err != nil {
@@ -192,7 +193,7 @@ func (s *predictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricN
 	return []external_metrics.ExternalMetricValue{metric}, val > s.metadata.activationThreshold, nil
 }
 
-func (s *predictEventsScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
+func (s *PredictEventsScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	metricName := kedautil.NormalizeString("predict-events")
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
@@ -206,11 +207,11 @@ func (s *predictEventsScaler) GetMetricSpecForScaling(context.Context) []v2.Metr
 	return []v2.MetricSpec{metricSpec}
 }
 
-func (s *predictEventsScaler) Close(context.Context) error {
+func (s *PredictEventsScaler) Close(context.Context) error {
 	return nil
 }
 
-func (s *predictEventsScaler) IsActive(ctx context.Context) (bool, error) {
+func (s *PredictEventsScaler) IsActive(ctx context.Context) (bool, error) {
 	// implement the IsActive method
 	return true, nil
 }
@@ -261,7 +262,12 @@ func callAPI(url string, method string, headers map[string]string, data []byte) 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			fmt.Println("Error closing body: ", err)
+		}
+	}(resp.Body)
 
 	// Read the response
 	body, _ := ioutil.ReadAll(resp.Body)
@@ -286,7 +292,7 @@ func QueryPrometheus(serverURL, query string, timeWindow string) ([]dataPoint, e
 	}
 
 	// Create a new Prometheus v1 API interface
-	api := v1.NewAPI(client)
+	promApi := v1.NewAPI(client)
 
 	timeWindowDuration, err := time.ParseDuration(timeWindow)
 	if err != nil {
@@ -294,7 +300,7 @@ func QueryPrometheus(serverURL, query string, timeWindow string) ([]dataPoint, e
 	}
 
 	// Query Prometheus
-	result, warnings, err := api.QueryRange(context.Background(), query, v1.Range{
+	result, warnings, err := promApi.QueryRange(context.Background(), query, v1.Range{
 		Start: time.Now().Add(-timeWindowDuration),
 		End:   time.Now(),
 		Step:  time.Minute,
