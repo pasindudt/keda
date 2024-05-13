@@ -24,9 +24,27 @@ import (
 	"k8s.io/metrics/pkg/apis/external_metrics"
 )
 
-type dataPoint struct {
-	Timestamp time.Time
-	Value     float64
+type PredictEventsScaler struct {
+	metricType v2.MetricTargetType
+	metadata   *predictEventsScalerMetadata
+	// logger     logr.Logger
+}
+
+type predictEventsScalerMetadata struct {
+	predictionSource    predictionSource
+	eventSource         eventSource
+	dataProcessor       dataProcessor
+	activationThreshold float64
+	triggerIndex        int
+	threshold           float64
+}
+
+type predictionSource struct {
+	HttpEndpoint string
+	HttpMethod   string
+	HttpHeaders  map[string]string
+	// ContainerUptimeSeconds int64
+	// Authentication  *authentication.AuthMeta
 }
 
 type eventSource struct {
@@ -41,40 +59,31 @@ type eventSourcePrometheusMetadata struct {
 	HistoryTimeWindow string
 }
 
-type predictionSource struct {
-	HttpEndpoint string
-	HttpMethod   string
-	HttpHeaders  map[string]string
-	eventSource  eventSource
-	// ContainerUptimeSeconds int64
-	// Authentication  *authentication.AuthMeta
+type dataPoint struct {
+	Timestamp time.Time
+	Value     float64
 }
 
-type PredictEventsScaler struct {
-	metricType v2.MetricTargetType
-	metadata   *predictEventsScalerMetadata
-	// logger     logr.Logger
+type dataProcessor struct {
+	data []dataPoint
 }
 
-type predictEventsScalerMetadata struct {
-	predictionSource    predictionSource
-	activationThreshold float64 // Add the missing activationThreshold field
-	triggerIndex        int
-	threshold           float64
+func (s *dataProcessor) ProcessData(data []dataPoint) ([]byte, error) {
+	jsonResult, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult, nil
 }
 
-func (s *eventSource) QueryData() ([]byte, error) {
+func (s *eventSource) QueryData() ([]dataPoint, error) {
 	switch s.sourceType {
 	case "prometheus":
 		result, err := QueryPrometheus(s.metadata.ServerAddress, s.metadata.Query, s.metadata.HistoryTimeWindow)
 		if err != nil {
 			return nil, err
 		}
-		jsonResult, err := json.Marshal(result)
-		if err != nil {
-			return nil, err
-		}
-		return jsonResult, nil
+		return result, nil
 	default:
 		return nil, errors.New("unsupported event source type")
 	}
@@ -126,28 +135,28 @@ func setPredictEventsScalerMetadata(meta *predictEventsScalerMetadata, config *s
 	}
 
 	if val, ok := config.TriggerMetadata["eventSourceType"]; ok && val != "" {
-		meta.predictionSource.eventSource.sourceType = val
+		meta.eventSource.sourceType = val
 	} else {
 		return fmt.Errorf("no %s given", "eventSourceType")
 
 	}
 
-	if meta.predictionSource.eventSource.sourceType == "prometheus" {
-		meta.predictionSource.eventSource.metadata = &eventSourcePrometheusMetadata{}
+	if meta.eventSource.sourceType == "prometheus" {
+		meta.eventSource.metadata = &eventSourcePrometheusMetadata{}
 		if val, ok := config.TriggerMetadata["prometheusServerAddress"]; ok && val != "" {
-			meta.predictionSource.eventSource.metadata.ServerAddress = val
+			meta.eventSource.metadata.ServerAddress = val
 		} else {
 			return fmt.Errorf("no %s given", "prometheusServerAddress")
 		}
 
 		if val, ok := config.TriggerMetadata["prometheusQuery"]; ok && val != "" {
-			meta.predictionSource.eventSource.metadata.Query = val
+			meta.eventSource.metadata.Query = val
 		} else {
 			return fmt.Errorf("no %s given", "prometheusQuery")
 		}
 
 		if val, ok := config.TriggerMetadata["prometheusQueryHistoryTimeWindow"]; ok && val != "" {
-			meta.predictionSource.eventSource.metadata.HistoryTimeWindow = val
+			meta.eventSource.metadata.HistoryTimeWindow = val
 		} else {
 			return fmt.Errorf("no %s given", "prometheusQueryHistoryTimeWindow")
 		}
@@ -182,10 +191,21 @@ func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerCon
 }
 
 func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	val, err := s.metadata.predictionSource.getPrediction()
+
+	data, err := s.metadata.eventSource.QueryData()
+	if err != nil {
+		return nil, false, fmt.Errorf("error while querying event source: %s", err)
+	}
+
+	processedData, err := s.metadata.dataProcessor.ProcessData(data)
+	if err != nil {
+		return nil, false, fmt.Errorf("error while processing data: %s", err)
+	}
+
+	val, err := s.metadata.predictionSource.getPrediction(processedData)
 
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("error while get prediction: %s", err)
 	}
 
 	metric := GenerateMetricInMili(metricName, val)
@@ -216,22 +236,13 @@ func (s *PredictEventsScaler) IsActive(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (s *predictionSource) getPrediction() (float64, error) {
-
-	// Query Prometheus
-	// result, err := QueryPrometheus(s.eventSource, s.HttpMethod, s.HttpHeaders, s.HttpData)
-
-	data, err := s.eventSource.QueryData()
-	if err != nil {
-		return 0, fmt.Errorf("error querying event source: %s", err)
-	}
+func (s *predictionSource) getPrediction(data []byte) (float64, error) {
 	res, err := callAPI(s.HttpEndpoint, s.HttpMethod, s.HttpHeaders, data)
 	if err != nil {
 		err := fmt.Errorf("error calling prediction source: %s", err)
 		return 0, err
 	}
 	return res["prediction"].(float64), nil
-
 }
 
 func callAPI(url string, method string, headers map[string]string, data []byte) (map[string]interface{}, error) {
