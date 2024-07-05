@@ -25,38 +25,56 @@ import (
 )
 
 type PredictEventsScaler struct {
-	metricType v2.MetricTargetType
-	metadata   *predictEventsScalerMetadata
-	// logger     logr.Logger
+	metricType  v2.MetricTargetType
+	metadata    *predictEventsScalerMetadata
+	dataCache   dataCache
+	inputSource inputSource
+	mlService   mlService
 }
 
 type predictEventsScalerMetadata struct {
-	predictionSource    predictionSource
-	eventSource         eventSource
-	dataProcessor       dataProcessor
-	activationThreshold float64
-	triggerIndex        int
-	threshold           float64
+	activationThreshold  float64
+	triggerIndex         int
+	threshold            float64
+	containerStartUpTime time.Duration
 }
 
-type predictionSource struct {
-	HttpEndpoint string
-	HttpMethod   string
-	HttpHeaders  map[string]string
-	// ContainerUptimeSeconds int64
-	// Authentication  *authentication.AuthMeta
+type inputSource interface {
+	configure(config *scalersconfig.ScalerConfig) error
+	queryData() ([]dataPoint, error)
 }
 
-type eventSource struct {
-	sourceType string
-	metadata   *eventSourcePrometheusMetadata
-	// Authentication *authentication.AuthMeta
+type mlService interface {
+	getPrediction(data []byte) (float64, error)
+	sendData(data []byte) error
 }
 
-type eventSourcePrometheusMetadata struct {
-	ServerAddress     string
-	Query             string
-	HistoryTimeWindow string
+type dataCache interface {
+	getData(time time.Time) (float64, error)
+	setData(data float64, time time.Time) error
+}
+
+type inputSourcePrometheus struct {
+	serverAddress      string
+	query              string
+	historyTimeWindow  time.Duration
+	timeStep           time.Duration
+	dataInputFrequency time.Duration
+}
+
+type mlServiceHttp struct {
+	dataHttpEndpoint             string
+	dataHttpMethod               string
+	dataHttpHeaders              map[string]string
+	predictionHttpEndpoint       string
+	predictionHttpMethod         string
+	predictionHttpHeaders        map[string]string
+	predictionFutureTimeWindow   time.Duration
+	predictionRetrievalFrequency time.Duration
+}
+
+type dataCacheInMemory struct {
+	data []dataPoint
 }
 
 type dataPoint struct {
@@ -64,153 +82,257 @@ type dataPoint struct {
 	Value     float64
 }
 
-type dataProcessor struct {
-	data []dataPoint
-}
+// --------------------------------------------------------------
+// -------Input Source Implementation----------------------------
+// --------------------------------------------------------------
+func (s *inputSourcePrometheus) configure(config *scalersconfig.ScalerConfig) error {
 
-func (s *dataProcessor) ProcessData(data []dataPoint) ([]byte, error) {
-	jsonResult, err := json.Marshal(data)
-	if err != nil {
-		return nil, err
+	if val, ok := config.TriggerMetadata["inputDataSourceServerAddress"]; ok && val != "" {
+		s.serverAddress = val
+	} else {
+		return fmt.Errorf("no %s given", "inputDataSourceServerAddress")
 	}
-	return jsonResult, nil
-}
 
-func (s *eventSource) QueryData() ([]dataPoint, error) {
-	switch s.sourceType {
-	case "prometheus":
-		result, err := QueryPrometheus(s.metadata.ServerAddress, s.metadata.Query, s.metadata.HistoryTimeWindow)
+	if val, ok := config.TriggerMetadata["inputDataSourceQuery"]; ok && val != "" {
+		s.query = val
+	} else {
+		return fmt.Errorf("no %s given", "inputDataSourceQuery")
+	}
+
+	if val, ok := config.TriggerMetadata["inputDataSourceHistoryTimeWindow"]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("error parsing %s: %w", "inputDataSourceHistoryTimeWindow", err)
 		}
-		return result, nil
-	default:
-		return nil, errors.New("unsupported event source type")
+		s.historyTimeWindow = parsedVal
+	} else {
+		return fmt.Errorf("no %s given", "inputDataSourceHistoryTimeWindow")
 	}
-}
 
-func getMapFromStr(str string) map[string]string {
-	m := make(map[string]string)
-	for _, s := range strings.Split(str, "\n") {
-		kv := strings.Split(s, ":")
-		m[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-	}
-	return m
-}
-
-func setPredictEventsScalerMetadata(meta *predictEventsScalerMetadata, config *scalersconfig.ScalerConfig) error {
-
-	if val, ok := config.TriggerMetadata["threshold"]; ok && val != "" {
-		parsedVal, err := strconv.ParseFloat(val, 64)
+	if val, ok := config.TriggerMetadata["inputDataSourceTimeStep"]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
 		if err != nil {
-			return fmt.Errorf("error parsing %s: %w", "threshold", err)
+			return fmt.Errorf("error parsing %s: %w", "inputDataSourceTimeStep", err)
 		}
-		meta.threshold = parsedVal
+		s.timeStep = parsedVal
 	} else {
-		return fmt.Errorf("no %s given", "threshold")
+		return fmt.Errorf("no %s given", "inputDataSourceTimeStep")
 	}
 
-	if val, ok := config.TriggerMetadata["activationThreshold"]; ok && val != "" {
-		meta.activationThreshold, _ = strconv.ParseFloat(val, 64)
-	} else {
-		return fmt.Errorf("no %s given", "activationThreshold")
-	}
-
-	if val, ok := config.TriggerMetadata["predictionSourceHttpEndpoint"]; ok && val != "" {
-		meta.predictionSource.HttpEndpoint = val
-	} else {
-		return fmt.Errorf("no %s given", "predictionSourceHttpEndpoint")
-	}
-
-	if val, ok := config.TriggerMetadata["predictionSourceHttpMethod"]; ok && val != "" {
-		meta.predictionSource.HttpMethod = val
-	} else {
-		return fmt.Errorf("no %s given", "predictionSourceHttpMethod")
-	}
-
-	if val, ok := config.TriggerMetadata["predictionSourceHttpHeaders"]; ok && val != "" {
-		meta.predictionSource.HttpHeaders = getMapFromStr(val)
-	} else {
-		return fmt.Errorf("no %s given", "predictionSourceHttpHeaders")
-	}
-
-	if val, ok := config.TriggerMetadata["eventSourceType"]; ok && val != "" {
-		meta.eventSource.sourceType = val
-	} else {
-		return fmt.Errorf("no %s given", "eventSourceType")
-
-	}
-
-	if meta.eventSource.sourceType == "prometheus" {
-		meta.eventSource.metadata = &eventSourcePrometheusMetadata{}
-		if val, ok := config.TriggerMetadata["prometheusServerAddress"]; ok && val != "" {
-			meta.eventSource.metadata.ServerAddress = val
-		} else {
-			return fmt.Errorf("no %s given", "prometheusServerAddress")
+	if val, ok := config.TriggerMetadata["dataInputFrequency"]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("error parsing %s: %w", "dataInputFrequency", err)
 		}
-
-		if val, ok := config.TriggerMetadata["prometheusQuery"]; ok && val != "" {
-			meta.eventSource.metadata.Query = val
-		} else {
-			return fmt.Errorf("no %s given", "prometheusQuery")
-		}
-
-		if val, ok := config.TriggerMetadata["prometheusQueryHistoryTimeWindow"]; ok && val != "" {
-			meta.eventSource.metadata.HistoryTimeWindow = val
-		} else {
-			return fmt.Errorf("no %s given", "prometheusQueryHistoryTimeWindow")
-		}
-
+		s.dataInputFrequency = parsedVal
+	} else {
+		return fmt.Errorf("no %s given", "dataInputFrequency")
 	}
 
 	return nil
 }
 
-func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (*PredictEventsScaler, error) {
+func (s *inputSourcePrometheus) queryData() ([]dataPoint, error) {
+	return queryPrometheus(s.serverAddress, s.query, s.historyTimeWindow)
+}
 
-	// eventSource := &eventSource{}
+// --------------------------------------------------------------
+// -------ML Service Implementation------------------------------
+// --------------------------------------------------------------
+func (s *mlServiceHttp) getPrediction(data []byte) (float64, error) {
+	_, err := callAPI(s.predictionHttpEndpoint, s.predictionHttpMethod, s.predictionHttpHeaders, data)
+	if err != nil {
+		return 0, fmt.Errorf("error calling prediction source: %s", err)
+	}
+	return 0, nil
+}
 
-	predictEventsScalerMetadata := &predictEventsScalerMetadata{}
-	predictEventsScalerMetadata.triggerIndex = config.TriggerIndex
+func (s *mlServiceHttp) sendData(data []byte) error {
+	_, err := callAPI(s.dataHttpEndpoint, s.dataHttpMethod, s.dataHttpHeaders, data)
+	if err != nil {
+		return fmt.Errorf("error calling data source: %s", err)
+	}
+	return nil
+}
+
+// --------------------------------------------------------------
+// -------Data Cache Implementation------------------------------
+// --------------------------------------------------------------
+func (s *dataCacheInMemory) getData(time time.Time) (float64, error) {
+	return 0, nil
+}
+
+func (s *dataCacheInMemory) setData(data float64, time time.Time) error {
+	return nil
+}
+
+// --------------------------------------------------------------
+// -------Predict Events Scaler utility functions----------------
+// --------------------------------------------------------------
+func setMetadata(config *scalersconfig.ScalerConfig) (*predictEventsScalerMetadata, error) {
+
+	meta := &predictEventsScalerMetadata{}
+
+	if val, ok := config.TriggerMetadata["threshold"]; ok && val != "" {
+		parsedVal, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing %s: %w", "threshold", err)
+		}
+		meta.threshold = parsedVal
+	} else {
+		return nil, fmt.Errorf("no %s given", "threshold")
+	}
+
+	if val, ok := config.TriggerMetadata["activationThreshold"]; ok && val != "" {
+		parsedVal, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing %s: %w", "activationThreshold", err)
+		}
+		meta.activationThreshold = parsedVal
+	} else {
+		return nil, fmt.Errorf("no %s given", "activationThreshold")
+	}
+
+	if val, ok := config.TriggerMetadata["containerStartUpTime"]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing %s: %w", "containerStartUpTime", err)
+		}
+		meta.containerStartUpTime = parsedVal
+	} else {
+		return nil, fmt.Errorf("no %s given", "containerStartUpTime")
+	}
+
+	meta.triggerIndex = config.TriggerIndex
+	return meta, nil
+}
+
+func setInputSource(config *scalersconfig.ScalerConfig) (inputSource, error) {
+	if val, ok := config.TriggerMetadata["eventSourceType"]; ok && val != "" {
+		if val == "prometheus" {
+			inputSource := &inputSourcePrometheus{}
+			err := inputSource.configure(config)
+			if err != nil {
+				return nil, fmt.Errorf("error configuring input source: %s", err)
+			}
+			return inputSource, nil
+		}
+	}
+	return nil, fmt.Errorf("error setting input source")
+}
+
+func setMLService(config *scalersconfig.ScalerConfig) (mlService, error) {
+
+	mlService := &mlServiceHttp{}
+
+	if val, ok := config.TriggerMetadata["mlServiceDataInputHttpEndpoint"]; ok && val != "" {
+		mlService.dataHttpEndpoint = val
+	} else {
+		return nil, fmt.Errorf("no %s given", "mlServiceDataInputHttpEndpoint")
+	}
+
+	if val, ok := config.TriggerMetadata["mlServiceDataInputHttpMethod"]; ok && val != "" {
+		mlService.dataHttpMethod = val
+	} else {
+		return nil, fmt.Errorf("no %s given", "mlServiceDataInputHttpMethod")
+	}
+
+	if val, ok := config.TriggerMetadata["mlServiceDataInputHttpHeaders"]; ok && val != "" {
+		mlService.dataHttpHeaders = getMapFromStr(val)
+	} else {
+		return nil, fmt.Errorf("no %s given", "mlServiceDataInputHttpHeaders")
+	}
+
+	if val, ok := config.TriggerMetadata["mlServicePredictionHttpEndpoint"]; ok && val != "" {
+		mlService.predictionHttpEndpoint = val
+	} else {
+		return nil, fmt.Errorf("no %s given", "mlServicePredictionHttpEndpoint")
+	}
+
+	if val, ok := config.TriggerMetadata["mlServicePredictionHttpMethod"]; ok && val != "" {
+		mlService.predictionHttpMethod = val
+	} else {
+		return nil, fmt.Errorf("no %s given", "mlServicePredictionHttpMethod")
+	}
+
+	if val, ok := config.TriggerMetadata["mlServicePredictionHttpHeaders"]; ok && val != "" {
+		mlService.predictionHttpHeaders = getMapFromStr(val)
+	} else {
+		return nil, fmt.Errorf("no %s given", "mlServicePredictionHttpHeaders")
+	}
+
+	if val, ok := config.TriggerMetadata["mlServicePredictionFutureTimeWindow"]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing %s: %w", "mlServicePredictionFutureTimeWindow", err)
+		}
+		mlService.predictionFutureTimeWindow = parsedVal
+	} else {
+		return nil, fmt.Errorf("no %s given", "mlServicePredictionFutureTimeWindow")
+	}
+
+	if val, ok := config.TriggerMetadata["predictionRetrievalFrequency"]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing %s: %w", "predictionRetrievalFrequency", err)
+		}
+		mlService.predictionRetrievalFrequency = parsedVal
+	} else {
+		return nil, fmt.Errorf("no %s given", "predictionRetrievalFrequency")
+	}
+
+	return mlService, nil
+}
+
+func setDataCache(config *scalersconfig.ScalerConfig) (dataCache, error) {
+	return &dataCacheInMemory{}, nil
+}
+
+// --------------------------------------------------------------
+// -------Predict Events Scaler Implementation------------------
+// --------------------------------------------------------------
+func (s *PredictEventsScaler) configure(ctx context.Context, config *scalersconfig.ScalerConfig) error {
 
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
-		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
+		return fmt.Errorf("error getting scaler metric type: %w", err)
 	}
 
-	err = setPredictEventsScalerMetadata(predictEventsScalerMetadata, config)
+	metadata, err := setMetadata(config)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error setting medatdat: %w", err)
 	}
 
-	predictEventsScaler := &PredictEventsScaler{}
-	predictEventsScaler.metricType = metricType
-	predictEventsScaler.metadata = predictEventsScalerMetadata
+	inputSource, err := setInputSource(config)
+	if err != nil {
+		return fmt.Errorf("error setting input source: %w", err)
+	}
 
-	return predictEventsScaler, nil
+	mlService, err := setMLService(config)
+	if err != nil {
+		return fmt.Errorf("error setting ml service: %w", err)
+	}
+
+	dataCache, err := setDataCache(config)
+	if err != nil {
+		return fmt.Errorf("error setting data cache: %w", err)
+	}
+
+	s.metricType = metricType
+	s.metadata = metadata
+	s.inputSource = inputSource
+	s.mlService = mlService
+	s.dataCache = dataCache
+
+	return nil
 }
 
-func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+func (s *PredictEventsScaler) initialize(ctx context.Context) error {
+	// start data input
 
-	data, err := s.metadata.eventSource.QueryData()
-	if err != nil {
-		return nil, false, fmt.Errorf("error while querying event source: %s", err)
-	}
+	// start prediction retrieval
 
-	processedData, err := s.metadata.dataProcessor.ProcessData(data)
-	if err != nil {
-		return nil, false, fmt.Errorf("error while processing data: %s", err)
-	}
-
-	val, err := s.metadata.predictionSource.getPrediction(processedData)
-
-	if err != nil {
-		return nil, false, fmt.Errorf("error while get prediction: %s", err)
-	}
-
-	metric := GenerateMetricInMili(metricName, val)
-
-	return []external_metrics.ExternalMetricValue{metric}, val > s.metadata.activationThreshold, nil
+	return nil
 }
 
 func (s *PredictEventsScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
@@ -227,22 +349,48 @@ func (s *PredictEventsScaler) GetMetricSpecForScaling(context.Context) []v2.Metr
 	return []v2.MetricSpec{metricSpec}
 }
 
+func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+
+	val, err := s.dataCache.getData(time.Now())
+	if err != nil {
+		return nil, false, fmt.Errorf("error while getting data from cache: %s", err)
+	}
+
+	metric := GenerateMetricInMili(metricName, val)
+
+	return []external_metrics.ExternalMetricValue{metric}, val > s.metadata.activationThreshold, nil
+}
+
 func (s *PredictEventsScaler) Close(context.Context) error {
 	return nil
 }
 
-func (s *PredictEventsScaler) IsActive(ctx context.Context) (bool, error) {
-	// implement the IsActive method
-	return true, nil
+// NewPredictEventsScaler creates a new instance of the PredictEventsScaler
+
+func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (*PredictEventsScaler, error) {
+
+	predictEventsScaler := &PredictEventsScaler{}
+
+	err := predictEventsScaler.configure(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
+	err = predictEventsScaler.initialize(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return predictEventsScaler, nil
 }
 
-func (s *predictionSource) getPrediction(data []byte) (float64, error) {
-	res, err := callAPI(s.HttpEndpoint, s.HttpMethod, s.HttpHeaders, data)
-	if err != nil {
-		err := fmt.Errorf("error calling prediction source: %s", err)
-		return 0, err
+func getMapFromStr(str string) map[string]string {
+	m := make(map[string]string)
+	for _, s := range strings.Split(str, "\n") {
+		kv := strings.Split(s, ":")
+		m[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 	}
-	return res["prediction"].(float64), nil
+	return m
 }
 
 func callAPI(url string, method string, headers map[string]string, data []byte) (map[string]interface{}, error) {
@@ -293,7 +441,7 @@ func callAPI(url string, method string, headers map[string]string, data []byte) 
 	return result, nil
 }
 
-func QueryPrometheus(serverURL, query string, timeWindow string) ([]dataPoint, error) {
+func queryPrometheus(serverURL, query string, timeWindowDuration time.Duration) ([]dataPoint, error) {
 	// Create a new Prometheus API client
 	client, err := api.NewClient(api.Config{
 		Address: serverURL,
@@ -305,10 +453,10 @@ func QueryPrometheus(serverURL, query string, timeWindow string) ([]dataPoint, e
 	// Create a new Prometheus v1 API interface
 	promApi := v1.NewAPI(client)
 
-	timeWindowDuration, err := time.ParseDuration(timeWindow)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing time window: %w", err)
-	}
+	//timeWindowDuration, err := time.ParseDuration(timeWindow)
+	//if err != nil {
+	//	return nil, fmt.Errorf("error parsing time window: %w", err)
+	//}
 
 	// Query Prometheus
 	result, warnings, err := promApi.QueryRange(context.Background(), query, v1.Range{
