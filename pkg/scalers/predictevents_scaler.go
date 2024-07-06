@@ -45,13 +45,13 @@ type inputSource interface {
 }
 
 type mlService interface {
-	getPrediction(data []byte) (float64, error)
+	getPrediction(data []byte) ([]byte, error)
 	sendData(data []byte) error
 }
 
 type dataCache interface {
 	getData(time time.Time) (float64, error)
-	setData(data float64, time time.Time) error
+	setData(data []byte) error
 }
 
 type inputSourcePrometheus struct {
@@ -139,12 +139,12 @@ func (s *inputSourcePrometheus) queryData() ([]dataPoint, error) {
 // --------------------------------------------------------------
 // -------ML Service Implementation------------------------------
 // --------------------------------------------------------------
-func (s *mlServiceHttp) getPrediction(data []byte) (float64, error) {
-	_, err := callAPI(s.predictionHttpEndpoint, s.predictionHttpMethod, s.predictionHttpHeaders, data)
+func (s *mlServiceHttp) getPrediction(data []byte) ([]byte, error) {
+	body, _, err := callHttp(s.predictionHttpEndpoint, s.predictionHttpMethod, s.predictionHttpHeaders, data)
 	if err != nil {
-		return 0, fmt.Errorf("error calling prediction source: %s", err)
+		return nil, fmt.Errorf("error calling prediction source: %s", err)
 	}
-	return 0, nil
+	return body, nil
 }
 
 func (s *mlServiceHttp) sendData(data []byte) error {
@@ -162,7 +162,7 @@ func (s *dataCacheInMemory) getData(time time.Time) (float64, error) {
 	return 0, nil
 }
 
-func (s *dataCacheInMemory) setData(data float64, time time.Time) error {
+func (s *dataCacheInMemory) setData(data []byte) error {
 	return nil
 }
 
@@ -328,9 +328,54 @@ func (s *PredictEventsScaler) configure(ctx context.Context, config *scalersconf
 }
 
 func (s *PredictEventsScaler) initialize(ctx context.Context) error {
-	// start data input
 
-	// start prediction retrieval
+	// start data feeding
+	dataInputFreq := s.inputSource.(*inputSourcePrometheus).dataInputFrequency
+	dataInputTicker := time.NewTicker(dataInputFreq)
+	dataInputDone := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case <-dataInputDone:
+				return
+			case t := <-dataInputTicker.C:
+				fmt.Println("Tick at", t)
+				queryData, err := s.inputSource.queryData()
+				if err != nil {
+					// handle error
+				}
+				err = s.mlService.sendData([]byte(fmt.Sprintf("%v", queryData)))
+				if err != nil {
+					// handle error
+				}
+			}
+		}
+	}()
+
+	// Start prediction retrieval
+	predictionRetrievalFreq := s.mlService.(*mlServiceHttp).predictionRetrievalFrequency
+	predictionRetrievalTicker := time.NewTicker(predictionRetrievalFreq)
+	predictionDone := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case <-predictionDone:
+				return
+			case t := <-predictionRetrievalTicker.C:
+				fmt.Println("Tick at", t)
+				res, err := s.mlService.getPrediction([]byte{})
+				if err != nil {
+					// handle error
+				}
+				err = s.dataCache.setData(res)
+				if err != nil {
+					// handle error
+				}
+			}
+		}
+	}()
 
 	return nil
 }
@@ -439,6 +484,42 @@ func callAPI(url string, method string, headers map[string]string, data []byte) 
 	}
 
 	return result, nil
+}
+
+func callHttp(url string, method string, headers map[string]string, data []byte) ([]byte, int, error) {
+
+	// Create a new request
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(data))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		if k == "Content-Type" {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+
+	// Send the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			fmt.Println("Error closing body: ", err)
+		}
+	}(resp.Body)
+
+	// Read the response
+	body, _ := ioutil.ReadAll(resp.Body)
+
+	return body, resp.StatusCode, nil
 }
 
 func queryPrometheus(serverURL, query string, timeWindowDuration time.Duration) ([]dataPoint, error) {
