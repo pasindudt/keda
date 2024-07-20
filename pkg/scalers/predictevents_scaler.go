@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	// "github.com/go-logr/logr"
@@ -23,6 +24,28 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 )
+
+// --------------------------------------------------------------
+// -------Constants----------------------------------------------
+// --------------------------------------------------------------
+const (
+	mlServiceHttpEndpoint       = "mlServiceHttpEndpoint"
+	mlServiceHttpMethod         = "mlServiceHttpMethod"
+	mlServiceHttpHeaders        = "mlServiceHttpHeaders"
+	mlServiceRetrievalFrequency = "mlServiceRetrievalFrequency"
+
+	dataInputSourceType              = "dataInputSourceType"
+	dataInputSourceServerAddress     = "dataInputSourceServerAddress"
+	dataInputSourceQuery             = "dataInputSourceQuery"
+	dataInputSourceQueryTimeStep     = "dataInputSourceQueryTimeStep"
+	dataInputSourceHistoryTimeWindow = "dataInputSourceHistoryTimeWindow"
+
+	containerStartUpTime = "containerStartUpTime"
+)
+
+// --------------------------------------------------------------
+// -------PredictEventsScaler Struct-----------------------------
+// --------------------------------------------------------------
 
 type PredictEventsScaler struct {
 	metricType  v2.MetricTargetType
@@ -39,20 +62,28 @@ type predictEventsScalerMetadata struct {
 	containerStartUpTime time.Duration
 }
 
+// --------------------------------------------------------------
+// -------Interfaces---------------------------------------------
+// --------------------------------------------------------------
+
 type inputSource interface {
 	configure(config *scalersconfig.ScalerConfig) error
 	queryData() ([]dataPoint, error)
 }
 
 type mlService interface {
-	getPrediction(data []byte) ([]byte, error)
-	sendData(data []byte) error
+	getPrediction(data []byte) ([]dataPoint, error)
+	getRetrievalFrequency() time.Duration
 }
 
 type dataCache interface {
 	getData(time time.Time) (float64, error)
-	setData(data []byte) error
+	setData(data []dataPoint) error
 }
+
+// --------------------------------------------------------------
+// -------Structs------------------------------------------------
+// --------------------------------------------------------------
 
 type inputSourcePrometheus struct {
 	serverAddress      string
@@ -63,23 +94,28 @@ type inputSourcePrometheus struct {
 }
 
 type mlServiceHttp struct {
-	dataHttpEndpoint             string
-	dataHttpMethod               string
-	dataHttpHeaders              map[string]string
-	predictionHttpEndpoint       string
-	predictionHttpMethod         string
-	predictionHttpHeaders        map[string]string
-	predictionFutureTimeWindow   time.Duration
+	endpoint                     string
+	method                       string
+	headers                      map[string]string
 	predictionRetrievalFrequency time.Duration
 }
 
 type dataCacheInMemory struct {
-	data []dataPoint
+	sync.RWMutex
+	data map[time.Time]float64
 }
 
 type dataPoint struct {
-	Timestamp time.Time
-	Value     float64
+	Timestamp time.Time `json:"timestamp"`
+	Value     float64   `json:"value"`
+}
+
+type predictions struct {
+	Data []dataPoint `json:"predictions"`
+}
+
+type inputData struct {
+	Data []dataPoint `json:"data"`
 }
 
 // --------------------------------------------------------------
@@ -87,82 +123,97 @@ type dataPoint struct {
 // --------------------------------------------------------------
 func (s *inputSourcePrometheus) configure(config *scalersconfig.ScalerConfig) error {
 
-	if val, ok := config.TriggerMetadata["inputDataSourceServerAddress"]; ok && val != "" {
+	if val, ok := config.TriggerMetadata[dataInputSourceServerAddress]; ok && val != "" {
 		s.serverAddress = val
 	} else {
-		return fmt.Errorf("no %s given", "inputDataSourceServerAddress")
+		return fmt.Errorf("no %s given", dataInputSourceServerAddress)
 	}
 
-	if val, ok := config.TriggerMetadata["inputDataSourceQuery"]; ok && val != "" {
+	if val, ok := config.TriggerMetadata[dataInputSourceQuery]; ok && val != "" {
 		s.query = val
 	} else {
-		return fmt.Errorf("no %s given", "inputDataSourceQuery")
+		return fmt.Errorf("no %s given", dataInputSourceQuery)
 	}
 
-	if val, ok := config.TriggerMetadata["inputDataSourceHistoryTimeWindow"]; ok && val != "" {
+	if val, ok := config.TriggerMetadata[dataInputSourceHistoryTimeWindow]; ok && val != "" {
 		parsedVal, err := time.ParseDuration(val)
 		if err != nil {
-			return fmt.Errorf("error parsing %s: %w", "inputDataSourceHistoryTimeWindow", err)
+			return fmt.Errorf("error parsing %s: %w", dataInputSourceHistoryTimeWindow, err)
 		}
 		s.historyTimeWindow = parsedVal
 	} else {
-		return fmt.Errorf("no %s given", "inputDataSourceHistoryTimeWindow")
+		return fmt.Errorf("no %s given", dataInputSourceHistoryTimeWindow)
 	}
 
-	if val, ok := config.TriggerMetadata["inputDataSourceTimeStep"]; ok && val != "" {
+	if val, ok := config.TriggerMetadata[dataInputSourceQueryTimeStep]; ok && val != "" {
 		parsedVal, err := time.ParseDuration(val)
 		if err != nil {
-			return fmt.Errorf("error parsing %s: %w", "inputDataSourceTimeStep", err)
+			return fmt.Errorf("error parsing %s: %w", dataInputSourceQueryTimeStep, err)
 		}
 		s.timeStep = parsedVal
 	} else {
-		return fmt.Errorf("no %s given", "inputDataSourceTimeStep")
-	}
-
-	if val, ok := config.TriggerMetadata["dataInputFrequency"]; ok && val != "" {
-		parsedVal, err := time.ParseDuration(val)
-		if err != nil {
-			return fmt.Errorf("error parsing %s: %w", "dataInputFrequency", err)
-		}
-		s.dataInputFrequency = parsedVal
-	} else {
-		return fmt.Errorf("no %s given", "dataInputFrequency")
+		return fmt.Errorf("no %s given", dataInputSourceQueryTimeStep)
 	}
 
 	return nil
 }
 
 func (s *inputSourcePrometheus) queryData() ([]dataPoint, error) {
-	return queryPrometheus(s.serverAddress, s.query, s.historyTimeWindow)
+	data, err := queryPrometheus(s.serverAddress, s.query, s.historyTimeWindow)
+	if err != nil {
+		return nil, fmt.Errorf("error querying Prometheus: %s", err)
+	}
+	return data, nil
 }
 
 // --------------------------------------------------------------
 // -------ML Service Implementation------------------------------
 // --------------------------------------------------------------
-func (s *mlServiceHttp) getPrediction(data []byte) ([]byte, error) {
-	body, _, err := callHttp(s.predictionHttpEndpoint, s.predictionHttpMethod, s.predictionHttpHeaders, data)
+func (s *mlServiceHttp) getPrediction(data []byte) ([]dataPoint, error) {
+	body, _, err := callHttp(s.endpoint, s.method, s.headers, data)
 	if err != nil {
 		return nil, fmt.Errorf("error calling prediction source: %s", err)
 	}
-	return body, nil
+	var result predictions
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		// handle error
+		fmt.Println("Error: ", err)
+		return nil, nil
+	}
+	return result.Data, nil
 }
 
-func (s *mlServiceHttp) sendData(data []byte) error {
-	_, err := callAPI(s.dataHttpEndpoint, s.dataHttpMethod, s.dataHttpHeaders, data)
-	if err != nil {
-		return fmt.Errorf("error calling data source: %s", err)
-	}
-	return nil
+func (s *mlServiceHttp) getRetrievalFrequency() time.Duration {
+	return s.predictionRetrievalFrequency
 }
 
 // --------------------------------------------------------------
 // -------Data Cache Implementation------------------------------
 // --------------------------------------------------------------
 func (s *dataCacheInMemory) getData(time time.Time) (float64, error) {
-	return 0, nil
+	s.RLock()
+	defer s.RUnlock()
+	var nearest *dataPoint
+	for timestamp, value := range s.data {
+		if timestamp.After(time) {
+			if nearest == nil || timestamp.Before(nearest.Timestamp) {
+				nearest = &dataPoint{
+					Timestamp: timestamp,
+					Value:     value,
+				}
+			}
+		}
+	}
+	return nearest.Value, nil
 }
 
-func (s *dataCacheInMemory) setData(data []byte) error {
+func (s *dataCacheInMemory) setData(dataSet []dataPoint) error {
+	s.Lock()
+	defer s.Unlock()
+	for _, data := range dataSet {
+		s.data[data.Timestamp] = data.Value
+	}
 	return nil
 }
 
@@ -193,14 +244,14 @@ func setMetadata(config *scalersconfig.ScalerConfig) (*predictEventsScalerMetada
 		return nil, fmt.Errorf("no %s given", "activationThreshold")
 	}
 
-	if val, ok := config.TriggerMetadata["containerStartUpTime"]; ok && val != "" {
+	if val, ok := config.TriggerMetadata[containerStartUpTime]; ok && val != "" {
 		parsedVal, err := time.ParseDuration(val)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing %s: %w", "containerStartUpTime", err)
+			return nil, fmt.Errorf("error parsing %s: %w", containerStartUpTime, err)
 		}
 		meta.containerStartUpTime = parsedVal
 	} else {
-		return nil, fmt.Errorf("no %s given", "containerStartUpTime")
+		return nil, fmt.Errorf("no %s given", containerStartUpTime)
 	}
 
 	meta.triggerIndex = config.TriggerIndex
@@ -208,7 +259,7 @@ func setMetadata(config *scalersconfig.ScalerConfig) (*predictEventsScalerMetada
 }
 
 func setInputSource(config *scalersconfig.ScalerConfig) (inputSource, error) {
-	if val, ok := config.TriggerMetadata["eventSourceType"]; ok && val != "" {
+	if val, ok := config.TriggerMetadata[dataInputSourceType]; ok && val != "" {
 		if val == "prometheus" {
 			inputSource := &inputSourcePrometheus{}
 			err := inputSource.configure(config)
@@ -218,67 +269,39 @@ func setInputSource(config *scalersconfig.ScalerConfig) (inputSource, error) {
 			return inputSource, nil
 		}
 	}
-	return nil, fmt.Errorf("error setting input source")
+	return nil, fmt.Errorf("invalid input source type given")
 }
 
 func setMLService(config *scalersconfig.ScalerConfig) (mlService, error) {
 
 	mlService := &mlServiceHttp{}
 
-	if val, ok := config.TriggerMetadata["mlServiceDataInputHttpEndpoint"]; ok && val != "" {
-		mlService.dataHttpEndpoint = val
+	if val, ok := config.TriggerMetadata[mlServiceHttpEndpoint]; ok && val != "" {
+		mlService.endpoint = val
 	} else {
-		return nil, fmt.Errorf("no %s given", "mlServiceDataInputHttpEndpoint")
+		return nil, fmt.Errorf("no %s given", mlServiceHttpEndpoint)
 	}
 
-	if val, ok := config.TriggerMetadata["mlServiceDataInputHttpMethod"]; ok && val != "" {
-		mlService.dataHttpMethod = val
+	if val, ok := config.TriggerMetadata[mlServiceHttpMethod]; ok && val != "" {
+		mlService.method = val
 	} else {
-		return nil, fmt.Errorf("no %s given", "mlServiceDataInputHttpMethod")
+		return nil, fmt.Errorf("no %s given", mlServiceHttpMethod)
 	}
 
-	if val, ok := config.TriggerMetadata["mlServiceDataInputHttpHeaders"]; ok && val != "" {
-		mlService.dataHttpHeaders = getMapFromStr(val)
+	if val, ok := config.TriggerMetadata[mlServiceHttpHeaders]; ok && val != "" {
+		mlService.headers = getMapFromStr(val)
 	} else {
-		return nil, fmt.Errorf("no %s given", "mlServiceDataInputHttpHeaders")
+		return nil, fmt.Errorf("no %s given", mlServiceHttpHeaders)
 	}
 
-	if val, ok := config.TriggerMetadata["mlServicePredictionHttpEndpoint"]; ok && val != "" {
-		mlService.predictionHttpEndpoint = val
-	} else {
-		return nil, fmt.Errorf("no %s given", "mlServicePredictionHttpEndpoint")
-	}
-
-	if val, ok := config.TriggerMetadata["mlServicePredictionHttpMethod"]; ok && val != "" {
-		mlService.predictionHttpMethod = val
-	} else {
-		return nil, fmt.Errorf("no %s given", "mlServicePredictionHttpMethod")
-	}
-
-	if val, ok := config.TriggerMetadata["mlServicePredictionHttpHeaders"]; ok && val != "" {
-		mlService.predictionHttpHeaders = getMapFromStr(val)
-	} else {
-		return nil, fmt.Errorf("no %s given", "mlServicePredictionHttpHeaders")
-	}
-
-	if val, ok := config.TriggerMetadata["mlServicePredictionFutureTimeWindow"]; ok && val != "" {
+	if val, ok := config.TriggerMetadata[mlServiceRetrievalFrequency]; ok && val != "" {
 		parsedVal, err := time.ParseDuration(val)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing %s: %w", "mlServicePredictionFutureTimeWindow", err)
-		}
-		mlService.predictionFutureTimeWindow = parsedVal
-	} else {
-		return nil, fmt.Errorf("no %s given", "mlServicePredictionFutureTimeWindow")
-	}
-
-	if val, ok := config.TriggerMetadata["predictionRetrievalFrequency"]; ok && val != "" {
-		parsedVal, err := time.ParseDuration(val)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing %s: %w", "predictionRetrievalFrequency", err)
+			return nil, fmt.Errorf("error parsing %s: %w", mlServiceRetrievalFrequency, err)
 		}
 		mlService.predictionRetrievalFrequency = parsedVal
 	} else {
-		return nil, fmt.Errorf("no %s given", "predictionRetrievalFrequency")
+		return nil, fmt.Errorf("no %s given", mlServiceRetrievalFrequency)
 	}
 
 	return mlService, nil
@@ -327,33 +350,41 @@ func (s *PredictEventsScaler) configure(ctx context.Context, config *scalersconf
 	return nil
 }
 
+func (s *PredictEventsScaler) run() error {
+	// Fetch data from input source
+	queryData, err := s.inputSource.queryData()
+	if err != nil {
+		return fmt.Errorf("error querying data: %w", err)
+	}
+
+	// Send data to ML service
+	inputData := inputData{Data: queryData}
+	inputJson, err := json.Marshal(inputData)
+	if err != nil {
+		return fmt.Errorf("error marshalling input data: %w", err)
+	}
+
+	predictions, err := s.mlService.getPrediction(inputJson)
+	if err != nil {
+		return fmt.Errorf("error getting prediction: %w", err)
+	}
+
+	// Set data in cache
+	err = s.dataCache.setData(predictions)
+	if err != nil {
+		return fmt.Errorf("error setting data in cache: %w", err)
+	}
+
+	return nil
+}
+
 func (s *PredictEventsScaler) initialize(ctx context.Context) error {
 
-	// start data feeding
-	dataInputFreq := s.inputSource.(*inputSourcePrometheus).dataInputFrequency
-	dataInputTicker := time.NewTicker(dataInputFreq)
-	dataInputDone := make(chan bool)
+	err := s.run()
+	if err != nil {
+		return err
+	}
 
-	go func() {
-		for {
-			select {
-			case <-dataInputDone:
-				return
-			case t := <-dataInputTicker.C:
-				fmt.Println("Tick at", t)
-				queryData, err := s.inputSource.queryData()
-				if err != nil {
-					// handle error
-				}
-				err = s.mlService.sendData([]byte(fmt.Sprintf("%v", queryData)))
-				if err != nil {
-					// handle error
-				}
-			}
-		}
-	}()
-
-	// Start prediction retrieval
 	predictionRetrievalFreq := s.mlService.(*mlServiceHttp).predictionRetrievalFrequency
 	predictionRetrievalTicker := time.NewTicker(predictionRetrievalFreq)
 	predictionDone := make(chan bool)
@@ -365,11 +396,7 @@ func (s *PredictEventsScaler) initialize(ctx context.Context) error {
 				return
 			case t := <-predictionRetrievalTicker.C:
 				fmt.Println("Tick at", t)
-				res, err := s.mlService.getPrediction([]byte{})
-				if err != nil {
-					// handle error
-				}
-				err = s.dataCache.setData(res)
+				err := s.run()
 				if err != nil {
 					// handle error
 				}
