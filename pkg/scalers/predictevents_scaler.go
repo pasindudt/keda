@@ -211,6 +211,9 @@ func (s *dataCacheInMemory) getData(time time.Time) (float64, error) {
 func (s *dataCacheInMemory) setData(dataSet []dataPoint) error {
 	s.Lock()
 	defer s.Unlock()
+	if s.data == nil {
+		s.data = make(map[time.Time]float64)
+	}
 	for _, data := range dataSet {
 		s.data[data.Timestamp] = data.Value
 	}
