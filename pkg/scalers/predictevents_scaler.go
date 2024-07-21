@@ -537,6 +537,9 @@ func callHttp(url string, method string, headers map[string]string, data []byte)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
+		if resp == nil {
+			return nil, 0, err
+		}
 		return nil, resp.StatusCode, err
 	}
 	defer func(Body io.ReadCloser) {
