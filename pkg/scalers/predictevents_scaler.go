@@ -448,12 +448,12 @@ func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerCon
 
 	err := predictEventsScaler.configure(ctx, config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error configuring predictive scaler: %w", err)
 	}
 
 	err = predictEventsScaler.initialize(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error initializing predictive scaler: %w", err)
 	}
 
 	return predictEventsScaler, nil
