@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -102,7 +103,8 @@ type mlServiceHttp struct {
 
 type dataCacheInMemory struct {
 	sync.RWMutex
-	data map[time.Time]float64
+	data      map[time.Time]float64
+	lastValue float64
 }
 
 type dataPoint struct {
@@ -195,17 +197,60 @@ func (s *dataCacheInMemory) getData(time time.Time) (float64, error) {
 	s.RLock()
 	defer s.RUnlock()
 	var nearest *dataPoint
+	var previous *dataPoint
+	var next *dataPoint
+	nextDiff := math.MaxInt64
+	previousDiff := math.MaxInt64
 	for timestamp, value := range s.data {
+
+		diff := int(math.Abs(float64(time.Sub(timestamp).Milliseconds())))
+
 		if timestamp.After(time) {
-			if nearest == nil || timestamp.Before(nearest.Timestamp) {
-				nearest = &dataPoint{
+			if diff < nextDiff {
+				nextDiff = diff
+				next = &dataPoint{
+					Timestamp: timestamp,
+					Value:     value,
+				}
+			}
+		} else {
+			if diff < previousDiff {
+				previousDiff = diff
+				previous = &dataPoint{
 					Timestamp: timestamp,
 					Value:     value,
 				}
 			}
 		}
 	}
-	return nearest.Value, nil
+
+	if previous != nil && next != nil {
+		nearest = previous
+		if nextDiff < previousDiff {
+			nearest = next
+		}
+	} else if previous != nil && next == nil {
+		nearest = previous
+	} else if previous == nil && next != nil {
+		nearest = next
+	}
+
+	if nearest != nil {
+		s.lastValue = nearest.Value
+	}
+
+	// Delete old data
+	if previous != nil {
+		go func() {
+			for timestamp, _ := range s.data {
+				if timestamp.Before(previous.Timestamp) {
+					delete(s.data, timestamp)
+				}
+			}
+		}()
+	}
+
+	return s.lastValue, nil
 }
 
 func (s *dataCacheInMemory) setData(dataSet []dataPoint) error {
@@ -426,7 +471,8 @@ func (s *PredictEventsScaler) GetMetricSpecForScaling(context.Context) []v2.Metr
 
 func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 
-	val, err := s.dataCache.getData(time.Now())
+	targetTime := time.Now().Add(s.metadata.containerStartUpTime)
+	val, err := s.dataCache.getData(targetTime)
 	if err != nil {
 		return nil, false, fmt.Errorf("error while getting data from cache: %s", err)
 	}
