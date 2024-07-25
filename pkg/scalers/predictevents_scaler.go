@@ -78,7 +78,7 @@ type mlService interface {
 }
 
 type dataCache interface {
-	getData(time time.Time) (float64, error)
+	getData(time time.Time) (float64, bool, error)
 	setData(data []dataPoint) error
 }
 
@@ -193,12 +193,13 @@ func (s *mlServiceHttp) getRetrievalFrequency() time.Duration {
 // --------------------------------------------------------------
 // -------Data Cache Implementation------------------------------
 // --------------------------------------------------------------
-func (s *dataCacheInMemory) getData(time time.Time) (float64, error) {
+func (s *dataCacheInMemory) getData(time time.Time) (float64, bool, error) {
 	s.RLock()
 	defer s.RUnlock()
 	var nearest *dataPoint
 	var previous *dataPoint
 	var next *dataPoint
+	var needUpdate bool
 	nextDiff := math.MaxInt64
 	previousDiff := math.MaxInt64
 	for timestamp, value := range s.data {
@@ -250,7 +251,11 @@ func (s *dataCacheInMemory) getData(time time.Time) (float64, error) {
 		}()
 	}
 
-	return s.lastValue, nil
+	if previous == nil && next == nil {
+		needUpdate = true
+	}
+
+	return s.lastValue, needUpdate, nil
 }
 
 func (s *dataCacheInMemory) setData(dataSet []dataPoint) error {
@@ -371,7 +376,7 @@ func (s *PredictEventsScaler) configure(ctx context.Context, config *scalersconf
 
 	metadata, err := setMetadata(config)
 	if err != nil {
-		return fmt.Errorf("error setting medatdat: %w", err)
+		return fmt.Errorf("error setting metadata: %w", err)
 	}
 
 	inputSource, err := setInputSource(config)
@@ -446,7 +451,7 @@ func (s *PredictEventsScaler) initialize(ctx context.Context) error {
 				fmt.Println("Tick at", t)
 				err := s.run()
 				if err != nil {
-					// handle error
+					fmt.Printf("error while updating cache: %s", err)
 				}
 			}
 		}
@@ -472,9 +477,18 @@ func (s *PredictEventsScaler) GetMetricSpecForScaling(context.Context) []v2.Metr
 func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 
 	targetTime := time.Now().Add(s.metadata.containerStartUpTime)
-	val, err := s.dataCache.getData(targetTime)
+	val, needUpdate, err := s.dataCache.getData(targetTime)
 	if err != nil {
 		return nil, false, fmt.Errorf("error while getting data from cache: %s", err)
+	}
+
+	if needUpdate {
+		go func() {
+			err := s.run()
+			if err != nil {
+				fmt.Printf("error while updating cache: %s", err)
+			}
+		}()
 	}
 
 	metric := GenerateMetricInMili(metricName, val)
@@ -487,7 +501,6 @@ func (s *PredictEventsScaler) Close(context.Context) error {
 }
 
 // NewPredictEventsScaler creates a new instance of the PredictEventsScaler
-
 func NewPredictEventsScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (*PredictEventsScaler, error) {
 
 	predictEventsScaler := &PredictEventsScaler{}
