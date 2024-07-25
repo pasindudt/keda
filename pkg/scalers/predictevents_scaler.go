@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	"io"
 	"io/ioutil"
 	"math"
@@ -94,6 +95,16 @@ type inputSourcePrometheus struct {
 	dataInputFrequency time.Duration
 }
 
+type inputSourceInfluxdb struct {
+	serverAddress      string
+	org                string
+	bucket             string
+	measurement        string
+	historyTimeWindow  time.Duration
+	timeStep           time.Duration
+	dataInputFrequency time.Duration
+}
+
 type mlServiceHttp struct {
 	endpoint                     string
 	method                       string
@@ -164,6 +175,54 @@ func (s *inputSourcePrometheus) queryData() ([]dataPoint, error) {
 	data, err := queryPrometheus(s.serverAddress, s.query, s.historyTimeWindow)
 	if err != nil {
 		return nil, fmt.Errorf("error querying Prometheus: %s", err)
+	}
+	return data, nil
+}
+
+func (s *inputSourceInfluxdb) configure(config *scalersconfig.ScalerConfig) error {
+
+	if val, ok := config.TriggerMetadata[dataInputSourceServerAddress]; ok && val != "" {
+		s.serverAddress = val
+	} else {
+		return fmt.Errorf("no %s given", dataInputSourceServerAddress)
+	}
+
+	if val, ok := config.TriggerMetadata[dataInputSourceQuery]; ok && val != "" {
+		queryParts := strings.Split(val, ":")
+		s.org = queryParts[0]
+		s.bucket = queryParts[1]
+		s.measurement = queryParts[2]
+	} else {
+		return fmt.Errorf("no %s given", dataInputSourceQuery)
+	}
+
+	if val, ok := config.TriggerMetadata[dataInputSourceHistoryTimeWindow]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("error parsing %s: %w", dataInputSourceHistoryTimeWindow, err)
+		}
+		s.historyTimeWindow = parsedVal
+	} else {
+		return fmt.Errorf("no %s given", dataInputSourceHistoryTimeWindow)
+	}
+
+	if val, ok := config.TriggerMetadata[dataInputSourceQueryTimeStep]; ok && val != "" {
+		parsedVal, err := time.ParseDuration(val)
+		if err != nil {
+			return fmt.Errorf("error parsing %s: %w", dataInputSourceQueryTimeStep, err)
+		}
+		s.timeStep = parsedVal
+	} else {
+		return fmt.Errorf("no %s given", dataInputSourceQueryTimeStep)
+	}
+
+	return nil
+}
+
+func (s *inputSourceInfluxdb) queryData() ([]dataPoint, error) {
+	data, err := queryInfluxdb(s.serverAddress, s.org, s.bucket, s.measurement, s.timeStep.String(), s.historyTimeWindow)
+	if err != nil {
+		return nil, fmt.Errorf("error querying InfluxDB: %s", err)
 	}
 	return data, nil
 }
@@ -313,14 +372,19 @@ func setMetadata(config *scalersconfig.ScalerConfig) (*predictEventsScalerMetada
 
 func setInputSource(config *scalersconfig.ScalerConfig) (inputSource, error) {
 	if val, ok := config.TriggerMetadata[dataInputSourceType]; ok && val != "" {
+		var inputSource inputSource
 		if val == "prometheus" {
-			inputSource := &inputSourcePrometheus{}
-			err := inputSource.configure(config)
-			if err != nil {
-				return nil, fmt.Errorf("error configuring input source: %s", err)
-			}
-			return inputSource, nil
+			inputSource = &inputSourcePrometheus{}
+		} else if val == "influxdb" {
+			inputSource = &inputSourceInfluxdb{}
+		} else {
+			return nil, fmt.Errorf("invalid input source type given")
 		}
+		err := inputSource.configure(config)
+		if err != nil {
+			return nil, fmt.Errorf("error configuring input source: %s", err)
+		}
+		return inputSource, nil
 	}
 	return nil, fmt.Errorf("invalid input source type given")
 }
@@ -702,5 +766,61 @@ func parsePrometheusResult(result model.Value) ([]dataPoint, error) {
 	default:
 		return nil, errors.ErrUnsupported
 	}
+	return out, nil
+}
+
+func queryInfluxdb(serverURL, org, bucket, measurement, time_step string, timeWindowDuration time.Duration) ([]dataPoint, error) {
+	// Create a new InfluxDB client
+	client := influxdb2.NewClient(serverURL, "")
+	defer client.Close()
+
+	//queryParts := strings.Split(query, ":")
+	//org := queryParts[0]
+	//bucket := queryParts[1]
+	//measurement := queryParts[2]
+
+	// Get the query client
+	queryAPI := client.QueryAPI(org)
+
+	query := fmt.Sprintf(`
+        from(bucket:"%s")
+        |> range(start: -%s)
+        |> filter(fn: (r) => r._measurement == "%s")
+        |> aggregateWindow(every: %s, fn: mean, createEmpty: false)
+    `, bucket, timeWindowDuration, measurement, time_step)
+
+	// Query
+	result, err := queryAPI.Query(context.Background(), query)
+	if err != nil {
+		return nil, fmt.Errorf("error querying InfluxDB: %w", err)
+	}
+
+	// Process the result
+	var out []dataPoint
+	for result.Next() {
+		// Access the values
+		t := result.Record().Time()
+		v := result.Record().Value()
+
+		var value float64
+		if v != nil {
+			switch val := v.(type) {
+			case int64:
+				value = float64(val)
+			case float64:
+				value = val
+			default:
+				fmt.Printf("Unexpected type %T for value %v\n", v, v)
+				continue
+			}
+		}
+		out = append(out, dataPoint{Timestamp: t, Value: value})
+	}
+
+	// Check for errors
+	if result.Err() != nil {
+		return nil, fmt.Errorf("error processing InfluxDB query: %w", result.Err())
+	}
+
 	return out, nil
 }
