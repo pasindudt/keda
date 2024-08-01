@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/kedacore/keda/v2/pkg/scalers/authentication"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"io"
 	"io/ioutil"
 	"math"
@@ -93,6 +95,7 @@ type inputSourcePrometheus struct {
 	historyTimeWindow  time.Duration
 	timeStep           time.Duration
 	dataInputFrequency time.Duration
+	authMeta           *authentication.AuthMeta
 }
 
 type inputSourceInfluxdb struct {
@@ -110,6 +113,7 @@ type mlServiceHttp struct {
 	method                       string
 	headers                      map[string]string
 	predictionRetrievalFrequency time.Duration
+	authKey                      string
 }
 
 type dataCacheInMemory struct {
@@ -168,11 +172,18 @@ func (s *inputSourcePrometheus) configure(config *scalersconfig.ScalerConfig) er
 		return fmt.Errorf("no %s given", dataInputSourceQueryTimeStep)
 	}
 
+	auth, err := authentication.GetAuthConfigs(config.TriggerMetadata, config.AuthParams)
+	if err != nil {
+		return fmt.Errorf("error getting auth configs: %w", err)
+	}
+
+	s.authMeta = auth
+
 	return nil
 }
 
 func (s *inputSourcePrometheus) queryData() ([]dataPoint, error) {
-	data, err := queryPrometheus(s.serverAddress, s.query, s.historyTimeWindow)
+	data, err := queryPrometheus(s.serverAddress, s.query, s.historyTimeWindow, s.authMeta)
 	if err != nil {
 		return nil, fmt.Errorf("error querying Prometheus: %s", err)
 	}
@@ -231,7 +242,7 @@ func (s *inputSourceInfluxdb) queryData() ([]dataPoint, error) {
 // -------ML Service Implementation------------------------------
 // --------------------------------------------------------------
 func (s *mlServiceHttp) getPrediction(data []byte) ([]dataPoint, error) {
-	body, _, err := callHttp(s.endpoint, s.method, s.headers, data)
+	body, _, err := callHttp(s.endpoint, s.method, s.headers, s.authKey, data)
 	if err != nil {
 		return nil, fmt.Errorf("error calling prediction source: %s", err)
 	}
@@ -421,6 +432,10 @@ func setMLService(config *scalersconfig.ScalerConfig) (mlService, error) {
 		return nil, fmt.Errorf("no %s given", mlServiceRetrievalFrequency)
 	}
 
+	if config.AuthParams != nil {
+		mlService.authKey = config.AuthParams["mlServiceAuthKey"]
+	}
+
 	return mlService, nil
 }
 
@@ -547,6 +562,7 @@ func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricN
 	}
 
 	if needUpdate {
+		fmt.Println("Need update...")
 		go func() {
 			err := s.run()
 			if err != nil {
@@ -554,6 +570,8 @@ func (s *PredictEventsScaler) GetMetricsAndActivity(ctx context.Context, metricN
 			}
 		}()
 	}
+
+	fmt.Println("Metric return value for HPA: ", val)
 
 	metric := GenerateMetricInMili(metricName, val)
 
@@ -639,7 +657,7 @@ func callAPI(url string, method string, headers map[string]string, data []byte) 
 	return result, nil
 }
 
-func callHttp(url string, method string, headers map[string]string, data []byte) ([]byte, int, error) {
+func callHttp(url string, method string, headers map[string]string, autKey string, data []byte) ([]byte, int, error) {
 
 	// Create a new request
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(data))
@@ -649,8 +667,11 @@ func callHttp(url string, method string, headers map[string]string, data []byte)
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
+	if autKey != "" {
+		req.Header.Set("Authorization", autKey)
+	}
 	for k, v := range headers {
-		if k == "Content-Type" {
+		if k == "Content-Type" || k == "Authorization" {
 			continue
 		}
 		req.Header.Set(k, v)
@@ -678,22 +699,44 @@ func callHttp(url string, method string, headers map[string]string, data []byte)
 	return body, resp.StatusCode, nil
 }
 
-func queryPrometheus(serverURL, query string, timeWindowDuration time.Duration) ([]dataPoint, error) {
+func queryPrometheus(serverURL, query string, timeWindowDuration time.Duration, authMeta *authentication.AuthMeta) ([]dataPoint, error) {
 	// Create a new Prometheus API client
-	client, err := api.NewClient(api.Config{
-		Address: serverURL,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error creating Prometheus client: %w", err)
+	var promClient api.Client
+	var err error
+
+	switch {
+	case authMeta == nil:
+		promClient, err = api.NewClient(api.Config{
+			Address: serverURL,
+		})
+	case authMeta.EnableBasicAuth:
+		promClient, err = api.NewClient(api.Config{
+			Address: serverURL,
+			RoundTripper: promhttp.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				req.SetBasicAuth(authMeta.Username, authMeta.Password)
+				return http.DefaultTransport.RoundTrip(req)
+			}),
+		})
+	case authMeta.EnableBearerAuth:
+		promClient, err = api.NewClient(api.Config{
+			Address: serverURL,
+			RoundTripper: promhttp.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				req.Header.Set("Authorization", authentication.GetBearerToken(authMeta))
+				return http.DefaultTransport.RoundTrip(req)
+			}),
+		})
+	case authMeta.EnableCustomAuth:
+		promClient, err = api.NewClient(api.Config{
+			Address: serverURL,
+			RoundTripper: promhttp.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				req.Header.Set(authMeta.CustomAuthHeader, authMeta.CustomAuthValue)
+				return http.DefaultTransport.RoundTrip(req)
+			}),
+		})
 	}
 
 	// Create a new Prometheus v1 API interface
-	promApi := v1.NewAPI(client)
-
-	//timeWindowDuration, err := time.ParseDuration(timeWindow)
-	//if err != nil {
-	//	return nil, fmt.Errorf("error parsing time window: %w", err)
-	//}
+	promApi := v1.NewAPI(promClient)
 
 	// Query Prometheus
 	result, warnings, err := promApi.QueryRange(context.Background(), query, v1.Range{
