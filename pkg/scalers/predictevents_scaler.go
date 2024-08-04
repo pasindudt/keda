@@ -106,6 +106,7 @@ type inputSourceInfluxdb struct {
 	historyTimeWindow  time.Duration
 	timeStep           time.Duration
 	dataInputFrequency time.Duration
+	authToken          string
 }
 
 type mlServiceHttp struct {
@@ -227,11 +228,13 @@ func (s *inputSourceInfluxdb) configure(config *scalersconfig.ScalerConfig) erro
 		return fmt.Errorf("no %s given", dataInputSourceQueryTimeStep)
 	}
 
+	s.authToken = config.AuthParams["influxDBAuthKey"]
+
 	return nil
 }
 
 func (s *inputSourceInfluxdb) queryData() ([]dataPoint, error) {
-	data, err := queryInfluxdb(s.serverAddress, s.org, s.bucket, s.measurement, s.timeStep.String(), s.historyTimeWindow)
+	data, err := queryInfluxdb(s.serverAddress, s.org, s.bucket, s.measurement, s.timeStep.String(), s.historyTimeWindow, s.authToken)
 	if err != nil {
 		return nil, fmt.Errorf("error querying InfluxDB: %s", err)
 	}
@@ -812,25 +815,17 @@ func parsePrometheusResult(result model.Value) ([]dataPoint, error) {
 	return out, nil
 }
 
-func queryInfluxdb(serverURL, org, bucket, measurement, time_step string, timeWindowDuration time.Duration) ([]dataPoint, error) {
-	// Create a new InfluxDB client
-	client := influxdb2.NewClient(serverURL, "")
-	defer client.Close()
+func queryInfluxdb(serverURL, org, bucket, measurement, time_step string, timeWindowDuration time.Duration, authToken string) ([]dataPoint, error) {
 
-	//queryParts := strings.Split(query, ":")
-	//org := queryParts[0]
-	//bucket := queryParts[1]
-	//measurement := queryParts[2]
+	// Create a new InfluxDB client
+	client := influxdb2.NewClient(serverURL, authToken)
+	defer client.Close()
 
 	// Get the query client
 	queryAPI := client.QueryAPI(org)
 
-	query := fmt.Sprintf(`
-        from(bucket:"%s")
-        |> range(start: -%s)
-        |> filter(fn: (r) => r._measurement == "%s")
-        |> aggregateWindow(every: %s, fn: mean, createEmpty: false)
-    `, bucket, timeWindowDuration, measurement, time_step)
+	query := fmt.Sprintf(`from(bucket:"%s")|> range(start: -%s)|> filter(fn: (r) => r._measurement == "%s")|> aggregateWindow(every: %s, fn: sum, createEmpty: false)`,
+		bucket, timeWindowDuration, measurement, time_step)
 
 	// Query
 	result, err := queryAPI.Query(context.Background(), query)
